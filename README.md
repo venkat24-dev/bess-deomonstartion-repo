@@ -1,27 +1,53 @@
-# BESS Sizing & Performance Analysis Software
-
-**Size. Simulate. Validate. Analyze.**
-
-A Python-based Battery Energy Storage System (BESS) sizing application that evaluates battery-container requirements, verifies energy and power performance, and analyzes operating scenarios over a project's lifetime.
+## BESS Sizing & Performance Analysis Software
 
 <p align="center">
   <a href="https://bess-sizing-web.streamlit.app/">
-    <img src="https://static.streamlit.io/badges/streamlit_badge_black_white.svg" alt="Open Live App">
+    <img src="https://static.streamlit.io/badges/streamlit_badge_black_white.svg" alt="Launch Live Streamlit App">
   </a>
 </p>
 
 <p align="center">
-  <a href="https://bess-sizing-web.streamlit.app/"><strong>Launch Live Application</strong></a>
-  &nbsp; | &nbsp;
-  <a href="https://github.com/venkat24-dev/bess-deomonstartion-repo"><strong>View Source Code</strong></a>
+  <a href="https://bess-sizing-web.streamlit.app/"><strong>🌐 Launch Live Application</strong></a>
+  &nbsp; • &nbsp;
+  <a href="https://github.com/venkat24-dev/bess-deomonstartion-repo"><strong>💻 View Source Code</strong></a>
 </p>
 
 ---
 
-## Links
+## 📸 Application Preview
+
+Explore the main screens of the BESS sizing application, from engineering inputs to sizing results and performance verification.
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <strong>⚙️ 1. Project Inputs</strong><br><br>
+      <a href="https://github.com/venkat24-dev/bess-deomonstartion-repo/blob/526f11a4e2e4ffa99b74b76da93810785b337e95/bess%20inputs%20ui.png">
+        <img src="https://github.com/venkat24-dev/bess-deomonstartion-repo/raw/526f11a4e2e4ffa99b74b76da93810785b337e95/bess%20inputs%20ui.png" alt="BESS Sizing Application Inputs" width="100%">
+      </a><br>
+      <sub>Configure project requirements, battery parameters, and supported operating assumptions.</sub>
+    </td>
+    <td align="center" width="50%">
+      <strong>📊 2. Sizing Results</strong><br><br>
+      <a href="https://github.com/venkat24-dev/bess-deomonstartion-repo/blob/526f11a4e2e4ffa99b74b76da93810785b337e95/bess%20results%20ui.png">
+        <img src="https://github.com/venkat24-dev/bess-deomonstartion-repo/raw/526f11a4e2e4ffa99b74b76da93810785b337e95/bess%20results%20ui.png" alt="BESS Sizing Application Results" width="100%">
+      </a><br>
+      <sub>Review calculated sizing outputs and supported performance verification results.</sub>
+    </td>
+  </tr>
+</table>
+
+<p align="center">
+  <a href="https://bess-sizing-web.streamlit.app/"><strong>▶ Try the Interactive Application</strong></a>
+</p>
+
+---
+
+## 🔗 Project Links
 
 - **Live Application:** https://bess-sizing-web.streamlit.app/
 - **GitHub Repository:** https://github.com/venkat24-dev/bess-deomonstartion-repo
+
 
 ## Overview
 
