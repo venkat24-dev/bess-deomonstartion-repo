@@ -5,7 +5,6 @@ Deploy:        push the repository to GitHub and point Streamlit Community Cloud
 """
 from __future__ import annotations
 
-import io
 import os
 from dataclasses import replace
 from pathlib import Path
@@ -14,6 +13,12 @@ import pandas as pd
 import streamlit as st
 
 from bess import analyser
+from bess.catalog_import import (
+    MAX_CATALOG_UPLOAD_SIZE_MB,
+    CatalogUploadError,
+    CatalogValidationError,
+    parse_catalog_upload,
+)
 from bess.database import AC_KEYS, AC_LABELS, load_database, select_by_c_rate
 from bess.engine import (
     AugEvent,
@@ -43,8 +48,8 @@ def _default_db():
 
 
 @st.cache_data(show_spinner=False)
-def _uploaded_db(data: bytes):
-    return load_database(io.BytesIO(data))
+def _uploaded_db(data: bytes, filename: str):
+    return parse_catalog_upload(data, filename)
 
 
 def _status_style(v):
@@ -81,13 +86,34 @@ def yesno(label, key, default=False, help=None):
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("Settings")
-    up = st.file_uploader("Product database (.xlsx)", type=["xlsx"], help="Leave empty to use the bundled BESS_DATABASE.xlsx")
-    try:
-        db = _uploaded_db(up.getvalue()) if up is not None else _default_db()
-        st.caption(f"{'Uploaded' if up is not None else 'Bundled'} database: {len(db)} container options")
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"Could not read the database: {exc}")
-        st.stop()
+    up = st.file_uploader(
+        "Product database (.xlsx)",
+        help="Leave empty to use the bundled BESS_DATABASE.xlsx. CSV files are not supported.",
+        max_upload_size=MAX_CATALOG_UPLOAD_SIZE_MB,
+    )
+    catalog_state_key = "last_valid_product_catalog"
+    if catalog_state_key not in st.session_state:
+        st.session_state[catalog_state_key] = _default_db()
+    if up is None:
+        db = _default_db()
+        st.session_state[catalog_state_key] = db
+        db_source = "Bundled"
+    else:
+        try:
+            db = _uploaded_db(up.getvalue(), up.name)
+            st.session_state[catalog_state_key] = db
+            db_source = "Uploaded"
+        except CatalogValidationError as exc:
+            st.error("Could not use the uploaded product database: " + "; ".join(exc.report.errors))
+            db = st.session_state[catalog_state_key]
+            db_source = "Last valid"
+            st.warning("The existing product catalog is unchanged and remains active.")
+        except CatalogUploadError as exc:
+            st.error(str(exc))
+            db = st.session_state[catalog_state_key]
+            db_source = "Last valid"
+            st.warning("The existing product catalog is unchanged and remains active.")
+    st.caption(f"{db_source} database: {len(db)} container options")
     status_style = st.radio("Match result labels", ["MATCHED / NOT MATCHED", "TRUE / FALSE"]).split(" / ")[0]
     status_style = "TRUE/FALSE" if status_style == "TRUE" else "MATCHED"
     aux_kw_fix = False

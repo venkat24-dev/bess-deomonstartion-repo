@@ -201,7 +201,7 @@ API; the Excel-based loading path remains in effect.
 | `bess/report.py` | Excel export |
 | `tests/test_bess.py` | `pytest -q` (formulas checked against hand calculations) |
 
-To change the database, replace `data/BESS_DATABASE.xlsx` (same sheet structure) or upload a new file from the sidebar.
+To change the database, replace `data/BESS_DATABASE.xlsx` (same label-based sheet structure) or upload a new file from the sidebar. Settings accepts validated `.xlsx` workbooks up to 200 MB; CSV is not supported. An invalid upload leaves the last valid catalog active. Clear the uploader to return to the bundled six-option catalog.
 
 ## How the specification is implemented
 

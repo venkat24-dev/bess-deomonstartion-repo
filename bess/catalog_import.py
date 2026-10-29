@@ -30,6 +30,9 @@ from bess.models import (
     ContainerTemperatureBand,
 )
 
+MAX_CATALOG_UPLOAD_SIZE_MB = 200
+MAX_CATALOG_UPLOAD_SIZE_BYTES = MAX_CATALOG_UPLOAD_SIZE_MB * 1024 * 1024
+
 
 @dataclass(frozen=True)
 class ContainerValidation:
@@ -66,6 +69,10 @@ class CatalogValidationError(ValueError):
         super().__init__(detail)
 
 
+class CatalogUploadError(ValueError):
+    """The uploaded file is not an allowed catalog workbook."""
+
+
 class CatalogIntegrityError(RuntimeError):
     """Stored rows do not match the immutable workbook revision."""
 
@@ -88,16 +95,20 @@ def _source_key(container: Container) -> str:
     return f"{container.energy_mwh:g}MWh_{container.c_rate:g}C"
 
 
-def _read_plan(source: str | Path) -> _CatalogPlan:
-    path = Path(source)
-    source_filename = path.name
-    try:
-        payload = path.read_bytes()
-    except OSError as exc:
-        report = CatalogValidationReport(
-            source_filename, "", False, (), (f"Cannot read workbook: {exc}",), ()
-        )
-        return _CatalogPlan(report, ())
+def _read_plan(source: str | Path | bytes, source_filename: str | None = None) -> _CatalogPlan:
+    if isinstance(source, bytes):
+        payload = source
+        filename = source_filename or "uploaded.xlsx"
+    else:
+        path = Path(source)
+        filename = path.name
+        try:
+            payload = path.read_bytes()
+        except OSError as exc:
+            report = CatalogValidationReport(
+                filename, "", False, (), (f"Cannot read workbook: {exc}",), ()
+            )
+            return _CatalogPlan(report, ())
 
     digest = hashlib.sha256(payload).hexdigest()
     errors: list[str] = []
@@ -107,7 +118,7 @@ def _read_plan(source: str | Path) -> _CatalogPlan:
         workbook = load_workbook(io.BytesIO(payload), data_only=True, read_only=True)
     except (BadZipFile, InvalidFileException, IndexError, KeyError, OSError, TypeError, ValueError) as exc:
         report = CatalogValidationReport(
-            source_filename,
+            filename,
             digest,
             False,
             (),
@@ -226,7 +237,7 @@ def _read_plan(source: str | Path) -> _CatalogPlan:
         )
 
     report = CatalogValidationReport(
-        source_filename,
+        filename,
         digest,
         not errors,
         tuple(summaries),
@@ -252,6 +263,28 @@ def _source_parameter(worksheet: Any, pattern: str) -> float | None:
 def dry_run_catalog(source: str | Path) -> CatalogValidationReport:
     """Parse and validate a workbook without opening or writing to a database."""
     return _read_plan(source).report
+
+
+def dry_run_catalog_bytes(payload: bytes, source_filename: str) -> CatalogValidationReport:
+    """Parse and validate uploaded workbook bytes without writing to a database."""
+    return _read_plan(payload, source_filename).report
+
+
+def parse_catalog_upload(payload: bytes, source_filename: str) -> list[Container]:
+    """Validate an uploaded XLSX workbook before returning its usable catalog."""
+    if Path(source_filename).suffix.casefold() != ".xlsx":
+        raise CatalogUploadError(
+            "Unsupported product database file type. Upload an Excel .xlsx workbook; CSV files are not supported."
+        )
+    if len(payload) > MAX_CATALOG_UPLOAD_SIZE_BYTES:
+        raise CatalogUploadError(
+            f"Product database files must be no larger than {MAX_CATALOG_UPLOAD_SIZE_MB} MB."
+        )
+
+    plan = _read_plan(payload, source_filename)
+    if not plan.report.is_valid:
+        raise CatalogValidationError(plan.report)
+    return list(plan.parsed)
 
 
 def _decimal(value: float) -> Decimal:
