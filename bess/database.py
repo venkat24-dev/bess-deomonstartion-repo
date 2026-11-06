@@ -40,7 +40,6 @@ AC_LABELS = {
     "measurement": "Measurement accuracy",
 }
 
-
 @dataclass
 class Container:
     id: str
@@ -79,7 +78,6 @@ class Container:
     @property
     def max_years(self) -> int:
         return min(len(self.soh), len(self.dc_rte)) - 1
-
 
 # --------------------------------------------------------------------------
 # low-level helpers
