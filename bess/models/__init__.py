@@ -12,10 +12,20 @@ from .catalog import (
     SimulationRun,
     SizingRequest,
 )
-from .project import Organization, OrganizationMember, Project, ProjectMember, User
+from .project import (
+    AuditEvent,
+    Organization,
+    OrganizationMember,
+    Project,
+    ProjectAccessGrant,
+    ProjectMember,
+    ProjectVersion,
+    User,
+)
 
 __all__ = [
     "Base",
+    "AuditEvent",
     "CatalogRevision",
     "ContainerACParameter",
     "ContainerCalendarDegradation",
@@ -27,7 +37,9 @@ __all__ = [
     "Organization",
     "OrganizationMember",
     "Project",
+    "ProjectAccessGrant",
     "ProjectMember",
+    "ProjectVersion",
     "SimulationRun",
     "SizingRequest",
     "User",

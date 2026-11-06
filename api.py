@@ -9,6 +9,7 @@ import logging
 import math
 import platform
 from dataclasses import asdict
+from datetime import datetime
 from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
@@ -19,12 +20,16 @@ import numpy as np
 import pandas as pd
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from bess.db_connection import DatabaseConfigurationError, get_session_factory
 from bess.database import Container, load_database
 from bess.engine import Inputs, size_container
 from bess.authentication import AuthenticatedUser, get_current_user
+from bess.models import Organization, OrganizationMember, User
 from bess.project_repository import (
     ProjectAccessError,
     ProjectConflict,
@@ -76,6 +81,8 @@ class RunRepository(Protocol):
     def fail_run(self, request_id: UUID, error_code: str, message: str) -> None: ...
 
     def get_run(self, request_id: UUID, user_id: UUID) -> dict | None: ...
+
+    def list_recent_runs(self, user_id: UUID, limit: int = 10) -> list[dict[str, Any]]: ...
 
 
 def get_repository() -> RunRepository:
@@ -175,6 +182,7 @@ class ProjectCreateRequest(BaseModel):
 class ProjectUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    expected_version: int = Field(ge=1)
     name: str | None = Field(default=None, min_length=1, max_length=300)
     description: str | None = None
 
@@ -183,7 +191,77 @@ class ProjectMemberRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     user_id: UUID
-    role: Literal["owner", "editor", "viewer"]
+    role: Literal["editor", "viewer"]
+
+
+class ProjectMemberRoleRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["editor", "viewer"]
+
+
+class ProjectOwnershipTransferRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_user_id: UUID
+    expected_project_version: int = Field(ge=1)
+
+
+class ProjectVersionSaveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    simulation_request_id: UUID
+    expected_current_version: int = Field(ge=0)
+    change_summary: str | None = Field(default=None, max_length=1000)
+
+
+class ProjectVersionRestoreRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_current_version: int = Field(ge=0)
+    change_summary: str | None = Field(default=None, max_length=1000)
+
+
+class ProjectArchiveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_project_version: int = Field(ge=1)
+
+
+class ManagerAccessGrantRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: UUID
+    access_scope: Literal["management", "content_read"]
+    reason: str = Field(min_length=1, max_length=1000)
+    expires_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_expiration_timezone(self) -> ManagerAccessGrantRequest:
+        if self.expires_at is not None and self.expires_at.tzinfo is None:
+            raise ValueError("expires_at must include a timezone.")
+        if not self.reason.strip():
+            raise ValueError("reason must contain non-whitespace characters.")
+        return self
+
+
+class OrganizationMemberRoleRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["admin", "manager", "member"]
+
+
+class OrganizationMemberAddRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: UUID
+    role: Literal["admin", "manager", "member"]
+
+
+class OrganizationOwnershipTransferRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_user_id: UUID
 
 
 class SizingResponse(BaseModel):
@@ -219,6 +297,23 @@ class CatalogManifest(BaseModel):
 
 
 app = FastAPI(title="BESS Sizing API", version="1.0.0")
+
+
+@app.middleware("http")
+async def correlation_id_middleware(request: Request, call_next):
+    supplied_id = request.headers.get("X-Correlation-ID")
+    try:
+        correlation_id = UUID(supplied_id) if supplied_id else uuid4()
+    except ValueError:
+        return JSONResponse(status_code=400, content={"detail": "X-Correlation-ID must be a UUID."})
+    request.state.correlation_id = correlation_id
+    response = await call_next(request)
+    response.headers["X-Correlation-ID"] = str(correlation_id)
+    return response
+
+
+def get_correlation_id(request: Request) -> UUID:
+    return request.state.correlation_id
 
 
 @app.exception_handler(DatabaseUnavailable)
@@ -319,15 +414,64 @@ def read_catalog_manifest() -> dict[str, Any]:
     }
 
 
+@app.get("/api/v1/me")
+def read_current_profile(
+    user: AuthenticatedUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    try:
+        with get_session_factory()() as session:
+            profile = session.scalar(select(User).where(User.id == user.id))
+            if profile is None or not profile.is_active:
+                raise HTTPException(status_code=403, detail="User account is unavailable.")
+            organizations = session.execute(
+                select(Organization.id, Organization.name, OrganizationMember.role)
+                .join(
+                    OrganizationMember,
+                    OrganizationMember.organization_id == Organization.id,
+                )
+                .where(OrganizationMember.user_id == user.id)
+                .order_by(Organization.name, Organization.id)
+            ).all()
+            return {
+                "user": {
+                    "id": str(profile.id),
+                    "email": profile.email,
+                    "display_name": profile.display_name,
+                    "created_at": profile.created_at.isoformat(),
+                    "account_status": "active" if profile.is_active else "inactive",
+                },
+                "organizations": [
+                    {
+                        "id": str(row.id),
+                        "name": row.name,
+                        "role": row.role,
+                    }
+                    for row in organizations
+                ],
+            }
+    except HTTPException:
+        raise
+    except (DatabaseConfigurationError, SQLAlchemyError) as exc:
+        logger.error("Could not retrieve authenticated profile (%s)", type(exc).__name__)
+        raise HTTPException(
+            status_code=503, detail="Profile service is unavailable."
+        ) from exc
+
+
 @app.post("/api/v1/projects", status_code=201)
 def create_project(
     request: ProjectCreateRequest,
     user: AuthenticatedUser = Depends(get_current_user),
     repository: ProjectRepository = Depends(get_project_repository),
+    correlation_id: UUID = Depends(get_correlation_id),
 ) -> dict[str, Any]:
     try:
         return repository.create_project(
-            user.id, request.organization_id, request.name, request.description
+            user.id,
+            request.organization_id,
+            request.name,
+            request.description,
+            correlation_id,
         )
     except ProjectAccessError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -359,14 +503,21 @@ def update_project(
     request: ProjectUpdateRequest,
     user: AuthenticatedUser = Depends(get_current_user),
     repository: ProjectRepository = Depends(get_project_repository),
+    correlation_id: UUID = Depends(get_correlation_id),
 ) -> dict[str, Any]:
-    changes = request.model_dump(exclude_unset=True)
+    changes = request.model_dump(exclude_unset=True, exclude={"expected_version"})
     if not changes:
         raise HTTPException(status_code=422, detail="At least one project field must be provided.")
     if "name" in changes and changes["name"] is None:
         raise HTTPException(status_code=422, detail="Project name cannot be null.")
     try:
-        return repository.update_project(user.id, project_id, changes)
+        return repository.update_project(
+            user.id,
+            project_id,
+            request.expected_version,
+            changes,
+            correlation_id,
+        )
     except ProjectAccessError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ProjectConflict as exc:
@@ -379,11 +530,287 @@ def add_project_member(
     request: ProjectMemberRequest,
     user: AuthenticatedUser = Depends(get_current_user),
     repository: ProjectRepository = Depends(get_project_repository),
+    correlation_id: UUID = Depends(get_correlation_id),
 ) -> dict[str, str]:
     try:
         return repository.add_project_member(
-            user.id, project_id, request.user_id, request.role
+            user.id, project_id, request.user_id, request.role, correlation_id
         )
+    except ProjectAccessError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ProjectConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.patch("/api/v1/projects/{project_id}/members/{member_user_id}/role")
+def update_project_member_role(
+    project_id: UUID,
+    member_user_id: UUID,
+    request: ProjectMemberRoleRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+    repository: ProjectRepository = Depends(get_project_repository),
+    correlation_id: UUID = Depends(get_correlation_id),
+) -> dict[str, str]:
+    try:
+        return repository.update_project_member_role(
+            user.id, project_id, member_user_id, request.role, correlation_id
+        )
+    except ProjectAccessError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.delete(
+    "/api/v1/projects/{project_id}/members/{member_user_id}",
+    status_code=204,
+)
+def remove_project_member(
+    project_id: UUID,
+    member_user_id: UUID,
+    user: AuthenticatedUser = Depends(get_current_user),
+    repository: ProjectRepository = Depends(get_project_repository),
+    correlation_id: UUID = Depends(get_correlation_id),
+) -> None:
+    try:
+        repository.remove_project_member(
+            user.id, project_id, member_user_id, correlation_id
+        )
+    except ProjectAccessError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/projects/{project_id}/ownership")
+def transfer_project_ownership(
+    project_id: UUID,
+    request: ProjectOwnershipTransferRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+    repository: ProjectRepository = Depends(get_project_repository),
+    correlation_id: UUID = Depends(get_correlation_id),
+) -> dict[str, Any]:
+    try:
+        return repository.transfer_project_ownership(
+            user.id,
+            project_id,
+            request.target_user_id,
+            request.expected_project_version,
+            correlation_id,
+        )
+    except ProjectAccessError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ProjectConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/projects/{project_id}/archive")
+def archive_project(
+    project_id: UUID,
+    request: ProjectArchiveRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+    repository: ProjectRepository = Depends(get_project_repository),
+    correlation_id: UUID = Depends(get_correlation_id),
+) -> dict[str, Any]:
+    try:
+        return repository.archive_project(
+            user.id, project_id, request.expected_project_version, correlation_id
+        )
+    except ProjectAccessError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ProjectConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/projects/{project_id}/versions", status_code=201)
+def save_project_version(
+    project_id: UUID,
+    request: ProjectVersionSaveRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+    repository: ProjectRepository = Depends(get_project_repository),
+    correlation_id: UUID = Depends(get_correlation_id),
+) -> dict[str, Any]:
+    try:
+        return repository.create_version(
+            user.id,
+            project_id,
+            request.simulation_request_id,
+            request.expected_current_version,
+            request.change_summary,
+            correlation_id,
+        )
+    except ProjectAccessError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ProjectConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/projects/{project_id}/versions")
+def list_project_versions(
+    project_id: UUID,
+    user: AuthenticatedUser = Depends(get_current_user),
+    repository: ProjectRepository = Depends(get_project_repository),
+) -> list[dict[str, Any]]:
+    try:
+        return repository.list_versions(user.id, project_id)
+    except ProjectAccessError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/projects/{project_id}/versions/{version_number}")
+def read_project_version(
+    project_id: UUID,
+    version_number: int,
+    user: AuthenticatedUser = Depends(get_current_user),
+    repository: ProjectRepository = Depends(get_project_repository),
+) -> dict[str, Any]:
+    try:
+        version = repository.get_version(user.id, project_id, version_number)
+        if version is None:
+            raise HTTPException(status_code=404, detail="Project version not found.")
+        return version
+    except ProjectAccessError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/projects/{project_id}/versions/{version_number}/restore")
+def restore_project_version(
+    project_id: UUID,
+    version_number: int,
+    request: ProjectVersionRestoreRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+    repository: ProjectRepository = Depends(get_project_repository),
+    correlation_id: UUID = Depends(get_correlation_id),
+) -> dict[str, Any]:
+    try:
+        return repository.restore_version(
+            user.id,
+            project_id,
+            version_number,
+            request.expected_current_version,
+            request.change_summary,
+            correlation_id,
+        )
+    except ProjectAccessError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ProjectConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/projects/{project_id}/manager-access", status_code=201)
+def grant_manager_project_access(
+    project_id: UUID,
+    request: ManagerAccessGrantRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+    repository: ProjectRepository = Depends(get_project_repository),
+    correlation_id: UUID = Depends(get_correlation_id),
+) -> dict[str, Any]:
+    try:
+        return repository.grant_manager_access(
+            user.id,
+            project_id,
+            request.user_id,
+            request.access_scope,
+            request.reason,
+            request.expires_at,
+            correlation_id,
+        )
+    except ProjectAccessError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ProjectConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.delete("/api/v1/projects/{project_id}/manager-access/{grant_id}", status_code=204)
+def revoke_manager_project_access(
+    project_id: UUID,
+    grant_id: UUID,
+    user: AuthenticatedUser = Depends(get_current_user),
+    repository: ProjectRepository = Depends(get_project_repository),
+    correlation_id: UUID = Depends(get_correlation_id),
+) -> None:
+    try:
+        repository.revoke_manager_access(user.id, project_id, grant_id, correlation_id)
+    except ProjectAccessError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.patch("/api/v1/organizations/{organization_id}/members/{member_user_id}/role")
+def update_organization_member_role(
+    organization_id: UUID,
+    member_user_id: UUID,
+    request: OrganizationMemberRoleRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+    repository: ProjectRepository = Depends(get_project_repository),
+    correlation_id: UUID = Depends(get_correlation_id),
+) -> dict[str, str]:
+    try:
+        return repository.change_organization_member_role(
+            user.id,
+            organization_id,
+            member_user_id,
+            request.role,
+            correlation_id,
+        )
+    except ProjectAccessError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/organizations/{organization_id}/members", status_code=201)
+def add_organization_member(
+    organization_id: UUID,
+    request: OrganizationMemberAddRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+    repository: ProjectRepository = Depends(get_project_repository),
+    correlation_id: UUID = Depends(get_correlation_id),
+) -> dict[str, str]:
+    try:
+        return repository.add_organization_member(
+            user.id,
+            organization_id,
+            request.user_id,
+            request.role,
+            correlation_id,
+        )
+    except ProjectAccessError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ProjectConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.delete(
+    "/api/v1/organizations/{organization_id}/members/{member_user_id}",
+    status_code=204,
+)
+def remove_organization_member(
+    organization_id: UUID,
+    member_user_id: UUID,
+    user: AuthenticatedUser = Depends(get_current_user),
+    repository: ProjectRepository = Depends(get_project_repository),
+    correlation_id: UUID = Depends(get_correlation_id),
+) -> None:
+    try:
+        repository.remove_organization_member(
+            user.id, organization_id, member_user_id, correlation_id
+        )
+    except ProjectAccessError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ProjectConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/organizations/{organization_id}/ownership")
+def transfer_organization_ownership(
+    organization_id: UUID,
+    request: OrganizationOwnershipTransferRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+    repository: ProjectRepository = Depends(get_project_repository),
+    correlation_id: UUID = Depends(get_correlation_id),
+) -> dict[str, str]:
+    try:
+        repository.transfer_organization_ownership(
+            user.id, organization_id, request.target_user_id, correlation_id
+        )
+        return {
+            "organization_id": str(organization_id),
+            "owner_user_id": str(request.target_user_id),
+        }
     except ProjectAccessError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ProjectConflict as exc:
@@ -510,6 +937,20 @@ def create_sizing(
             headers={"X-Sizing-Request-ID": str(request_id)},
         ) from None
     return response
+
+
+@app.get("/api/v1/sizing/recent")
+def read_recent_sizing_runs(
+    limit: int = 10,
+    repository: RunRepository = Depends(get_repository),
+    user: AuthenticatedUser = Depends(get_current_user),
+) -> list[dict[str, Any]]:
+    if not 1 <= limit <= 50:
+        raise HTTPException(status_code=422, detail="limit must be between 1 and 50.")
+    try:
+        return repository.list_recent_runs(user.id, limit)
+    except SimulationPersistenceError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.get("/api/v1/sizing/{request_id}")

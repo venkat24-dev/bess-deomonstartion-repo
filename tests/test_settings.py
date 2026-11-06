@@ -215,6 +215,10 @@ def test_settings_upload_updates_sizing_and_recovers_after_invalid_upload(tmp_pa
     )
     at = AppTest.from_file(str(PROJECT_ROOT / "app.py"), default_timeout=120).run()
     assert not at.exception
+    next(widget for widget in at.radio if widget.key == "bess_workspace_navigation").set_value(
+        "Calculator"
+    ).run()
+    assert not at.exception
     assert any("Bundled database: 6 container options" in item.value for item in at.caption)
     assert any("7.044 MWh @ 0.25C" in item.value for item in at.info)
     assert any("34.0 %" in item.value for item in at.caption)

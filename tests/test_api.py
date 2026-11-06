@@ -33,7 +33,7 @@ TEST_USER = AuthenticatedUser(
 class MemoryRepository:
     def __init__(self) -> None:
         self.runs: dict[UUID, dict] = {}
-        self.idempotency_keys: dict[str, UUID] = {}
+        self.idempotency_keys: dict[tuple[UUID, str], UUID] = {}
 
     def ping(self) -> None:
         return None
@@ -50,8 +50,9 @@ class MemoryRepository:
         application_version: str,
         idempotency_key: str | None,
     ) -> dict | None:
-        if idempotency_key and idempotency_key in self.idempotency_keys:
-            prior_id = self.idempotency_keys[idempotency_key]
+        scoped_key = (user_id, idempotency_key) if idempotency_key else None
+        if scoped_key and scoped_key in self.idempotency_keys:
+            prior_id = self.idempotency_keys[scoped_key]
             prior = self.runs[prior_id]
             if _idempotency_identity(prior["input_snapshot"]) != _idempotency_identity(input_snapshot):
                 from bess.simulation_repository import IdempotencyConflict
@@ -73,7 +74,7 @@ class MemoryRepository:
             "status": "RUNNING",
         }
         if idempotency_key:
-            self.idempotency_keys[idempotency_key] = request_id
+            self.idempotency_keys[(user_id, idempotency_key)] = request_id
         return None
 
     def complete_run(self, request_id: UUID, response: dict, warnings: list[str], summary: dict) -> None:
@@ -102,6 +103,32 @@ class MemoryRepository:
             result["status"] = record["status"]
             result["error"] = record.get("error")
         return result
+
+    def list_recent_runs(self, user_id: UUID, limit: int = 10) -> list[dict]:
+        visible = []
+        for record in sorted(
+            self.runs.values(), key=lambda item: item["created_at"], reverse=True
+        ):
+            if record["project_id"] is None and record["owner_user_id"] != user_id:
+                continue
+            response = record["response"]
+            visible.append(
+                {
+                    "request_id": record["request_id"],
+                    "project_id": (
+                        str(record["project_id"]) if record["project_id"] else None
+                    ),
+                    "created_at": record["created_at"],
+                    "status": record["status"],
+                    "container_id": (
+                        response["container_id"] if response else None
+                    ),
+                    "summary": response["summary"] if response else None,
+                }
+            )
+            if len(visible) >= limit:
+                break
+        return visible
 
 
 @pytest.fixture
@@ -138,6 +165,76 @@ def test_list_containers(api_client):
     containers = response.json()
     assert len(containers) == 6
     assert any(item["id"] == "5.015MWh_0.25C" for item in containers)
+
+
+def test_current_profile_returns_only_backend_provisioned_identity_and_memberships(
+    api_client, monkeypatch
+):
+    import api as sizing_api
+
+    profile = type(
+        "Profile",
+        (),
+        {
+            "id": TEST_USER.id,
+            "is_active": True,
+            "email": "engineer@example.test",
+            "display_name": "Engineer",
+            "created_at": datetime(2026, 1, 2, tzinfo=timezone.utc),
+        },
+    )()
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def scalar(self, _statement):
+            return profile
+
+        def execute(self, _statement):
+            return type(
+                "Result",
+                (),
+                {
+                    "all": lambda _self: [
+                        type(
+                            "Membership",
+                            (),
+                            {
+                                "id": UUID("22222222-2222-2222-2222-222222222222"),
+                                "name": "Engineering",
+                                "role": "member",
+                            },
+                        )()
+                    ]
+                },
+            )()
+
+    monkeypatch.setattr(sizing_api, "get_session_factory", lambda: lambda: FakeSession())
+    client, _repository = api_client
+    response = client.get("/api/v1/me")
+    assert response.status_code == 200
+    assert response.json() == {
+        "user": {
+            "id": str(TEST_USER.id),
+            "email": "engineer@example.test",
+            "display_name": "Engineer",
+            "created_at": "2026-01-02T00:00:00+00:00",
+            "account_status": "active",
+        },
+        "organizations": [
+            {
+                "id": "22222222-2222-2222-2222-222222222222",
+                "name": "Engineering",
+                "role": "member",
+            }
+        ],
+    }
+    assert "employee_number" not in response.json()["user"]
+    assert "department" not in response.json()["user"]
 
 
 def test_catalog_manifest_hash_and_metadata_match_catalog_endpoint(api_client, monkeypatch):
@@ -550,6 +647,28 @@ def test_idempotency_key_rejects_different_input(api_client):
     assert conflict.status_code == 409
 
 
+def test_http_idempotency_key_can_be_reused_by_another_user(api_client):
+    client, repository = api_client
+    request = {
+        "container_id": "5.015MWh_0.25C",
+        "required_energy_mwh": 100,
+    }
+    first = _post_sizing(
+        client, request, headers={"Idempotency-Key": "same-company-key"}
+    )
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        id=UUID("22222222-2222-2222-2222-222222222222"),
+        oidc_issuer=TEST_USER.oidc_issuer,
+        oidc_subject="second-user",
+    )
+    second = _post_sizing(
+        client, request, headers={"Idempotency-Key": "same-company-key"}
+    )
+    assert first.status_code == second.status_code == 201
+    assert first.json()["request_id"] != second.json()["request_id"]
+    assert len(repository.runs) == 2
+
+
 def test_failed_calculation_is_persisted(api_client, monkeypatch):
     import api as sizing_api
 
@@ -626,6 +745,17 @@ def test_missing_run_returns_not_found(api_client):
     assert response.status_code == 404
 
 
+def test_recent_sizing_activity_is_authenticated_and_returns_saved_runs(api_client):
+    client, _repository = api_client
+    result = _post_sizing(client, {"container_id": "5.015MWh_0.25C"})
+    assert result.status_code == 201
+    recent = client.get("/api/v1/sizing/recent")
+    assert recent.status_code == 200
+    assert recent.json()[0]["request_id"] == result.json()["request_id"]
+    assert recent.json()[0]["container_id"] == "5.015MWh_0.25C"
+    assert client.get("/api/v1/sizing/recent?limit=0").status_code == 422
+
+
 def test_database_failure_is_reported_as_service_unavailable():
     class UnavailableRepository(MemoryRepository):
         def ping(self) -> None:
@@ -655,6 +785,7 @@ def test_sizing_and_project_routes_require_bearer_authentication(api_client):
     assert response.status_code == 401
     assert response.headers["www-authenticate"] == "Bearer"
     assert client.get("/api/v1/projects").status_code == 401
+    assert client.get("/api/v1/me").status_code == 401
 
 
 def test_sizing_result_is_not_visible_to_another_authenticated_user(api_client):
@@ -705,12 +836,13 @@ def test_optional_project_id_preserves_sizing_response_contract(api_client):
 
 def test_project_routes_pass_authenticated_identity_to_repository(api_client):
     class ProjectRepository:
-        def create_project(self, user_id, organization_id, name, description):
+        def create_project(self, user_id, organization_id, name, description, correlation_id):
             return {
                 "created_by_user_id": str(user_id),
                 "organization_id": str(organization_id),
                 "name": name,
                 "description": description,
+                "correlation_id": str(correlation_id),
             }
 
         def list_projects(self, user_id):
@@ -719,15 +851,22 @@ def test_project_routes_pass_authenticated_identity_to_repository(api_client):
         def get_project(self, user_id, project_id):
             return {"id": str(project_id), "created_by_user_id": str(user_id)}
 
-        def update_project(self, user_id, project_id, changes):
-            return {"id": str(project_id), "updated_by_user_id": str(user_id), **changes}
+        def update_project(self, user_id, project_id, expected_version, changes, correlation_id):
+            return {
+                "id": str(project_id),
+                "updated_by_user_id": str(user_id),
+                "expected_version": expected_version,
+                "correlation_id": str(correlation_id),
+                **changes,
+            }
 
-        def add_project_member(self, caller_id, project_id, member_user_id, role):
+        def add_project_member(self, caller_id, project_id, member_user_id, role, correlation_id):
             return {
                 "project_id": str(project_id),
                 "user_id": str(member_user_id),
                 "role": role,
                 "caller_id": str(caller_id),
+                "correlation_id": str(correlation_id),
             }
 
     app.dependency_overrides[get_project_repository] = ProjectRepository
@@ -745,9 +884,14 @@ def test_project_routes_pass_authenticated_identity_to_repository(api_client):
         {"created_by_user_id": str(TEST_USER.id)}
     ]
     assert client.get(f"/api/v1/projects/{project_id}").status_code == 200
-    assert client.patch(
-        f"/api/v1/projects/{project_id}", json={"name": "Updated"}
-    ).json()["updated_by_user_id"] == str(TEST_USER.id)
+    updated = client.patch(
+        f"/api/v1/projects/{project_id}",
+        json={"expected_version": 1, "name": "Updated"},
+    )
+    assert updated.json()["updated_by_user_id"] == str(TEST_USER.id)
+    assert updated.json()["expected_version"] == 1
+    correlation_id = UUID(updated.headers["X-Correlation-ID"])
+    assert updated.json()["correlation_id"] == str(correlation_id)
     added = client.post(
         f"/api/v1/projects/{project_id}/members",
         json={"user_id": member_id, "role": "viewer"},

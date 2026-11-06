@@ -170,6 +170,10 @@ def test_app_runs_without_exceptions():
 
     at = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"), default_timeout=120).run()
     assert not at.exception
+    next(w for w in at.radio if w.key == "bess_workspace_navigation").set_value(
+        "Calculator"
+    ).run()
+    assert not at.exception
     next(w for w in at.number_input if w.label == "C-rate").set_value(0.33).run()
     assert not at.exception
     at.chat_input[0].set_value("reduce DOD to 90% and SOH by 2%").run()

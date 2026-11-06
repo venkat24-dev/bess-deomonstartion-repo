@@ -22,8 +22,14 @@ from bess import simulation_repository
 from bess.models import SimulationRun, SizingRequest, User
 
 
-EXPECTED_REVISION = "20261012_0003"
-REQUIRED_TABLES = {"sizing_requests", "simulation_runs"}
+EXPECTED_REVISION = "20261028_0004"
+REQUIRED_TABLES = {
+    "sizing_requests",
+    "simulation_runs",
+    "project_versions",
+    "audit_events",
+    "project_access_grants",
+}
 
 
 @dataclass
@@ -123,7 +129,8 @@ def postgres_context(monkeypatch) -> PostgreSQLContext:
                     tracked_ids.update(
                         session.scalars(
                             select(SizingRequest.id).where(
-                                SizingRequest.idempotency_key.in_(context.idempotency_keys)
+                                SizingRequest.idempotency_key.in_(context.idempotency_keys),
+                                SizingRequest.created_by_user_id == context.user_id,
                             )
                         )
                     )

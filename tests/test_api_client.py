@@ -80,6 +80,43 @@ def test_submit_sizing_preserves_response_and_sends_bearer_and_idempotency():
     assert result == SIZING_RESULT
 
 
+def test_sizing_run_and_version_save_are_separate_explicit_api_calls():
+    calls = []
+
+    def handler(request):
+        calls.append((request.method, request.url.path))
+        if request.url.path == "/api/v1/sizing":
+            return httpx.Response(201, json=SIZING_RESULT)
+        if request.url.path == "/api/v1/projects/project-1/versions":
+            body = json.loads(request.content)
+            assert body == {
+                "simulation_request_id": SIZING_RESULT["request_id"],
+                "expected_current_version": 2,
+                "change_summary": "Updated load profile",
+            }
+            return httpx.Response(201, json={"version_number": 3})
+        return httpx.Response(404)
+
+    with _client(handler) as client:
+        result = client.submit_sizing(
+            {"project_id": "project-1", "container_id": "5.015MWh_0.25C"},
+            CATALOG_SHA256,
+        )
+        assert calls == [("POST", "/api/v1/sizing")]
+        version = client.save_project_version(
+            "project-1",
+            result["request_id"],
+            expected_current_version=2,
+            change_summary="Updated load profile",
+        )
+
+    assert version["version_number"] == 3
+    assert calls == [
+        ("POST", "/api/v1/sizing"),
+        ("POST", "/api/v1/projects/project-1/versions"),
+    ]
+
+
 def test_get_catalog_manifest_validates_and_returns_catalog_identity():
     def handler(request):
         assert request.url.path == "/api/v1/catalog/manifest"
@@ -129,6 +166,146 @@ def test_project_api_calls_use_the_authenticated_transport():
 
     with _client(handler) as client:
         assert client.list_projects() == [{"id": "project-1"}]
+
+
+def test_every_api_request_sends_a_unique_uuid_correlation_id():
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers["X-Correlation-ID"])
+        return httpx.Response(200, json=[])
+
+    with _client(handler) as client:
+        client.list_projects()
+        client.list_projects()
+
+    assert len(seen) == 2
+    assert seen[0] != seen[1]
+    assert all(len(value) == 36 for value in seen)
+
+
+def test_project_profile_create_open_and_version_workflows_use_real_routes():
+    calls = []
+
+    def handler(request):
+        calls.append((request.method, request.url.path))
+        if request.url.path == "/api/v1/me":
+            return httpx.Response(
+                200,
+                json={
+                    "user": {
+                        "id": "user-1",
+                        "email": "engineer@example.test",
+                        "created_at": "2026-01-02T00:00:00+00:00",
+                        "account_status": "active",
+                    },
+                    "organizations": [{"id": "org-1", "name": "Engineering", "role": "member"}],
+                },
+            )
+        if request.url.path == "/api/v1/projects" and request.method == "GET":
+            return httpx.Response(200, json=[{"id": "project-1", "name": "Demo"}])
+        if request.url.path == "/api/v1/projects/project-1":
+            return httpx.Response(200, json={"id": "project-1", "current_version_number": 0})
+        if request.url.path == "/api/v1/sizing/recent":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "request_id": "run-1",
+                        "created_at": "2026-01-01T00:00:00+00:00",
+                        "status": "SUCCEEDED",
+                    }
+                ],
+            )
+        if request.url.path.endswith("/versions") and request.method == "GET":
+            return httpx.Response(200, json=[])
+        if request.url.path == "/api/v1/projects/project-1/versions":
+            return httpx.Response(201, json={"version_number": 1})
+        if request.url.path.endswith("/versions/1"):
+            return httpx.Response(200, json={"version_number": 1})
+        if request.url.path.endswith("/versions/1/restore"):
+            return httpx.Response(200, json={"version_number": 2, "source_version_number": 1})
+        if request.method == "POST" and request.url.path == "/api/v1/projects":
+            return httpx.Response(201, json={"id": "project-created", "name": "New"})
+        return httpx.Response(404)
+
+    with _client(handler) as client:
+        profile = client.get_profile()
+        projects = client.list_projects()
+        recent = client.list_recent_sizing_runs()
+        project = client.get_project("project-1")
+        versions = client.list_project_versions("project-1")
+        saved = client.save_project_version("project-1", "run-1", 0, "Baseline")
+        loaded = client.get_project_version("project-1", 1)
+        restored = client.restore_project_version("project-1", 1, 1, "Restore")
+        created = client.create_project("org-1", "New")
+
+    assert profile["user"]["id"] == "user-1"
+    assert projects[0]["id"] == "project-1"
+    assert recent[0]["request_id"] == "run-1"
+    assert project["current_version_number"] == 0
+    assert versions == []
+    assert saved["version_number"] == 1
+    assert loaded["version_number"] == 1
+    assert restored["source_version_number"] == 1
+    assert created["id"] == "project-created"
+    assert len(calls) == 9
+
+
+def test_archive_project_uses_existing_version_checked_route():
+    observed = {}
+
+    def handler(request):
+        observed["method"] = request.method
+        observed["path"] = request.url.path
+        observed["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"id": "project-1", "archived_at": "now"})
+
+    with _client(handler) as client:
+        result = client.archive_project("project-1", 3)
+
+    assert observed == {
+        "method": "POST",
+        "path": "/api/v1/projects/project-1/archive",
+        "body": {"expected_project_version": 3},
+    }
+    assert result["archived_at"] == "now"
+
+
+def test_project_member_changes_use_only_authenticated_owner_routes():
+    observed = []
+
+    def handler(request):
+        observed.append((request.method, request.url.path))
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        if request.method == "POST":
+            return httpx.Response(201, json={"role": "viewer"})
+        return httpx.Response(200, json={"role": "editor"})
+
+    with _client(handler) as client:
+        client.add_project_member("project-1", "user-2", "viewer")
+        client.update_project_member_role("project-1", "user-2", "editor")
+        client.remove_project_member("project-1", "user-2")
+
+    assert observed == [
+        ("POST", "/api/v1/projects/project-1/members"),
+        ("PATCH", "/api/v1/projects/project-1/members/user-2/role"),
+        ("DELETE", "/api/v1/projects/project-1/members/user-2"),
+    ]
+
+
+def test_failed_project_creation_and_version_save_raise_without_success_response():
+    def handler(request):
+        if request.url.path == "/api/v1/projects":
+            return httpx.Response(503, text="database diagnostic")
+        return httpx.Response(409, text="stale version details")
+
+    with _client(handler) as client:
+        with pytest.raises(BESSAPIError, match="temporarily unavailable"):
+            client.create_project("org-1", "New project")
+        with pytest.raises(BESSAPIError, match="Refresh and retry"):
+            client.save_project_version("project-1", "run-1", 2, "Baseline")
 
 
 @pytest.mark.parametrize(
@@ -223,7 +400,7 @@ def test_catalog_conflict_is_reported_safely():
         )
 
     with _client(handler) as client:
-        with pytest.raises(BESSAPIError, match="retrieve the manifest") as error:
+        with pytest.raises(BESSAPIError, match="server catalog changed") as error:
             client.submit_sizing(
                 {"container_id": "5.015MWh_0.25C"},
                 catalog_sha256=CATALOG_SHA256,
@@ -231,6 +408,26 @@ def test_catalog_conflict_is_reported_safely():
     assert error.value.status_code == 409
     assert error.value.error_code == "catalog_mismatch"
     assert "arbitrary response text" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("status_code", "message"),
+    [
+        (401, "sign-in has expired"),
+        (403, "do not have permission"),
+        (404, "unavailable"),
+        (409, "Refresh and retry"),
+        (503, "temporarily unavailable"),
+    ],
+)
+def test_http_errors_have_safe_status_specific_messages(status_code, message):
+    with _client(
+        lambda _request: httpx.Response(status_code, text="private backend detail")
+    ) as client:
+        with pytest.raises(BESSAPIError, match=message) as error:
+            client.list_projects()
+    assert error.value.status_code == status_code
+    assert "private backend detail" not in str(error.value)
 
 
 def test_sizing_rejects_malformed_catalog_hash_before_request():

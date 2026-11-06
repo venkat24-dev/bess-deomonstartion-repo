@@ -13,13 +13,16 @@ from sqlalchemy.orm import configure_mappers
 from bess import db_connection
 from bess.db_connection import DatabaseConfigurationError
 from bess.models import (
+    AuditEvent,
     Base,
     CatalogRevision,
     ContainerModel,
     Organization,
     OrganizationMember,
     Project,
+    ProjectAccessGrant,
     ProjectMember,
+    ProjectVersion,
     SimulationRun,
     SizingRequest,
     User,
@@ -36,6 +39,9 @@ def test_all_foundation_models_register_in_bess_schema():
         "organization_members",
         "projects",
         "project_members",
+        "project_versions",
+        "audit_events",
+        "project_access_grants",
         "catalog_revisions",
         "container_models",
         "container_performance_years",
@@ -48,7 +54,7 @@ def test_all_foundation_models_register_in_bess_schema():
         "simulation_runs",
     }
     assert set(Base.metadata.tables) == {f"bess.{name}" for name in expected}
-    assert len(Base.metadata.tables) == 15
+    assert len(Base.metadata.tables) == 18
 
 
 def test_model_imports_do_not_open_a_database_connection(monkeypatch):
@@ -65,6 +71,8 @@ def test_models_have_expected_relationships_and_foreign_keys():
     assert {fk.target_fullname for fk in Project.__table__.foreign_keys} == {
         "bess.organizations.id",
         "bess.users.id",
+        "bess.project_versions.project_id",
+        "bess.project_versions.version_number",
     }
     assert {fk.target_fullname for fk in SimulationRun.__table__.foreign_keys} == {
         "bess.sizing_requests.id",
@@ -174,10 +182,10 @@ def test_health_check_runs_select_one_and_closes_connection():
     engine.dispose()
 
 
-def test_alembic_config_and_migration_are_create_only_for_bess():
+def test_alembic_chain_preserves_existing_history_and_adds_phase1_revision():
     config = Config(str(PROJECT_ROOT / "alembic.ini"))
     scripts = ScriptDirectory.from_config(config)
-    assert scripts.get_current_head() == "20261012_0003"
+    assert scripts.get_current_head() == "20261028_0004"
     migration = Path(scripts.get_revision("20261012_0001").path)
     source = migration.read_text(encoding="utf-8")
     assert 'SCHEMA = "bess"' in source
@@ -185,6 +193,20 @@ def test_alembic_config_and_migration_are_create_only_for_bess():
     assert "op.drop_table(" not in source.split("def upgrade()", 1)[1].split("def downgrade()", 1)[0]
     assert "public." not in source
     assert "op.execute(CreateSchema(SCHEMA, if_not_exists=True))" in source
+    phase1 = Path(scripts.get_revision("20261028_0004").path)
+    phase1_source = phase1.read_text(encoding="utf-8")
+    phase1_upgrade = phase1_source.split("def upgrade()", 1)[1].split(
+        "def downgrade()", 1
+    )[0]
+    assert scripts.get_revision("20261028_0004").down_revision == "20261012_0003"
+    assert "op.create_table(" in phase1_upgrade
+    assert "op.add_column(" in phase1_upgrade
+    assert "op.drop_table(" not in phase1_upgrade
+    assert "ownership_review" in phase1_upgrade
+    assert "uq_sizing_requests_user_idempotency_key" in phase1_upgrade
+    assert "users_preserve_active_project_owner" in phase1_upgrade
+    assert "project_versions_no_row_mutation" in phase1_upgrade
+    assert "audit_events_no_row_mutation" in phase1_upgrade
 
 
 def test_catalog_detail_migration_is_additive_and_bess_only():

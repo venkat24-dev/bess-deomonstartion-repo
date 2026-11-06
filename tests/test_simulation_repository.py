@@ -5,18 +5,21 @@ import json
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import create_engine, event, select
+from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from bess import simulation_repository
 from bess import project_repository
 from bess.models import (
+    AuditEvent,
     Base,
     Organization,
     OrganizationMember,
     Project,
+    ProjectAccessGrant,
     ProjectMember,
+    ProjectVersion,
     SimulationRun,
     SizingRequest,
     User,
@@ -48,6 +51,9 @@ def repository(monkeypatch):
         OrganizationMember.__table__,
         Project.__table__,
         ProjectMember.__table__,
+        ProjectVersion.__table__,
+        AuditEvent.__table__,
+        ProjectAccessGrant.__table__,
         SizingRequest.__table__,
         SimulationRun.__table__,
     ]
@@ -147,6 +153,113 @@ def test_persists_and_retrieves_completed_run(repository):
         assert request.input_snapshot["engine_inputs"]["required_energy_mwh"] == 100
 
 
+def test_recent_runs_are_limited_to_the_authenticated_creator_for_projectless_runs(
+    repository,
+):
+    own_id, _ = _start(repository, key="own")
+    other_user_id = uuid4()
+    with Session(repository.test_engine) as session:
+        session.add(
+            User(
+                id=other_user_id,
+                oidc_issuer="https://issuer.example.test/",
+                oidc_subject="other-recent-user",
+                is_active=True,
+            )
+        )
+        session.commit()
+    other_id, _ = _start(repository, key="other", user_id=other_user_id)
+    for request_id in (own_id, other_id):
+        repository.complete_run(
+            request_id,
+            {
+                "request_id": str(request_id),
+                "container_id": "container-a",
+                "accepted": True,
+                "margin_applied_pct": 14.0,
+                "in_range": True,
+                "note": "OK",
+                "summary": {"n_init": 21},
+                "discharging": [],
+                "charging": [],
+                "performance": [],
+                "verification": [],
+                "effective_inputs": {},
+                "catalog_sha256": "a" * 64,
+                "warnings": [],
+            },
+            [],
+            {"n_init": 21},
+        )
+
+    recent = repository.list_recent_runs(repository.test_user_id)
+    assert [item["request_id"] for item in recent] == [str(own_id)]
+    assert recent[0]["container_id"] == "container-a"
+
+
+def test_recent_project_runs_follow_project_membership(repository):
+    owner_id = repository.test_user_id
+    viewer_id, outsider_id, organization_id = uuid4(), uuid4(), uuid4()
+    with Session(repository.test_engine) as session:
+        session.add_all(
+            [
+                User(
+                    id=viewer_id,
+                    oidc_issuer="https://issuer.example.test/",
+                    oidc_subject="recent-viewer",
+                    is_active=True,
+                ),
+                User(
+                    id=outsider_id,
+                    oidc_issuer="https://issuer.example.test/",
+                    oidc_subject="recent-outsider",
+                    is_active=True,
+                ),
+                Organization(id=organization_id, name="Recent project"),
+                OrganizationMember(
+                    organization_id=organization_id, user_id=owner_id, role="owner"
+                ),
+                OrganizationMember(
+                    organization_id=organization_id, user_id=viewer_id, role="member"
+                ),
+                OrganizationMember(
+                    organization_id=organization_id, user_id=outsider_id, role="member"
+                ),
+            ]
+        )
+        session.commit()
+    projects = project_repository.ProjectRepository()
+    project = projects.create_project(owner_id, organization_id, "Recent project", None)
+    project_id = UUID(project["id"])
+    projects.add_project_member(owner_id, project_id, viewer_id, "viewer")
+    request_id, _ = _start(repository, project_id=project_id)
+    repository.complete_run(
+        request_id,
+        {
+            "request_id": str(request_id),
+            "container_id": "container-a",
+            "accepted": True,
+            "margin_applied_pct": 14.0,
+            "in_range": True,
+            "note": "OK",
+            "summary": {"n_init": 21},
+            "discharging": [],
+            "charging": [],
+            "performance": [],
+            "verification": [],
+            "effective_inputs": {},
+            "catalog_sha256": "a" * 64,
+            "warnings": [],
+        },
+        [],
+        {"n_init": 21},
+    )
+
+    assert repository.list_recent_runs(owner_id)[0]["request_id"] == str(request_id)
+    assert repository.list_recent_runs(viewer_id)[0]["request_id"] == str(request_id)
+    assert repository.list_recent_runs(outsider_id) == []
+
+
 def test_idempotency_returns_result_or_rejects_changed_input(repository):
     request_id, _ = _start(repository, key="same-key")
     response = {
@@ -168,6 +281,35 @@ def test_idempotency_returns_result_or_rejects_changed_input(repository):
     assert duplicate == response
     with pytest.raises(simulation_repository.IdempotencyConflict):
         _start(repository, _snapshot(101), key="same-key")
+
+
+def test_idempotency_keys_are_scoped_to_authenticated_user(repository):
+    other_user_id = uuid4()
+    with Session(repository.test_engine) as session, session.begin():
+        session.add(
+            User(
+                id=other_user_id,
+                oidc_issuer="https://issuer.example.test/",
+                oidc_subject="second-user",
+                is_active=True,
+            )
+        )
+
+    first_id, first_duplicate = _start(repository, key="shared-key")
+    second_id, second_duplicate = _start(
+        repository,
+        key="shared-key",
+        user_id=other_user_id,
+    )
+    assert first_duplicate is None
+    assert second_duplicate is None
+    assert first_id != second_id
+    with Session(repository.test_engine) as session:
+        assert session.scalar(
+            select(func.count()).select_from(SizingRequest).where(
+                SizingRequest.idempotency_key == "shared-key"
+            )
+        ) == 2
 
 
 def test_idempotency_ignores_execution_environment_changes(repository):

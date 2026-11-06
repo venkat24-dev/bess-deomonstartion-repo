@@ -332,3 +332,4 @@ def result_context(res: CaseResult) -> dict:
         "years": res.perf.round(3).reset_index().to_dict("records"),
         "verification": res.verify.round(3).reset_index().to_dict("records"),
     }
+
