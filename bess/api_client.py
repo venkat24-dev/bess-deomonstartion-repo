@@ -1,10 +1,11 @@
-"""Authenticated HTTP boundary for a future Streamlit-to-FastAPI integration."""
+"""Authenticated HTTP boundary for Streamlit-to-FastAPI requests."""
 from __future__ import annotations
 
 import ipaddress
 import re
 from typing import Any
 from urllib.parse import quote, urlsplit
+from uuid import uuid4
 
 import httpx
 
@@ -129,6 +130,28 @@ class BESSAPIClient:
             },
         )
 
+    def get_profile(self) -> dict[str, Any]:
+        result = self._object("GET", "/api/v1/me")
+        user = result.get("user")
+        organizations = result.get("organizations")
+        if (
+            not isinstance(user, dict)
+            or not isinstance(user.get("id"), str)
+            or user.get("account_status") not in {"active", "inactive"}
+            or not isinstance(user.get("created_at"), str)
+            or not isinstance(organizations, list)
+            or any(
+                not isinstance(item, dict)
+                or not isinstance(item.get("id"), str)
+                or not isinstance(item.get("name"), str)
+                or item.get("role")
+                not in {"owner", "admin", "manager", "member"}
+                for item in organizations
+            )
+        ):
+            raise BESSAPIError("Backend returned an invalid profile.")
+        return result
+
     def list_projects(self) -> list[dict[str, Any]]:
         result = self._request("GET", "/api/v1/projects")
         if not isinstance(result, list) or any(not isinstance(item, dict) for item in result):
@@ -137,6 +160,73 @@ class BESSAPIClient:
 
     def get_project(self, project_id: str) -> dict[str, Any]:
         return self._object("GET", f"/api/v1/projects/{quote(project_id, safe='')}")
+
+    def archive_project(
+        self, project_id: str, expected_project_version: int
+    ) -> dict[str, Any]:
+        if expected_project_version < 1:
+            raise ValueError("expected_project_version must be positive.")
+        return self._object(
+            "POST",
+            f"/api/v1/projects/{quote(project_id, safe='')}/archive",
+            json={"expected_project_version": expected_project_version},
+        )
+
+    def list_project_versions(self, project_id: str) -> list[dict[str, Any]]:
+        result = self._request(
+            "GET", f"/api/v1/projects/{quote(project_id, safe='')}/versions"
+        )
+        if not isinstance(result, list) or any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("version_number"), int)
+            or not isinstance(item.get("created_at"), str)
+            for item in result
+        ):
+            raise BESSAPIError("Backend returned an invalid project version list.")
+        return result
+
+    def get_project_version(self, project_id: str, version_number: int) -> dict[str, Any]:
+        if version_number < 1:
+            raise ValueError("version_number must be positive.")
+        return self._object(
+            "GET",
+            f"/api/v1/projects/{quote(project_id, safe='')}/versions/{version_number}",
+        )
+
+    def save_project_version(
+        self,
+        project_id: str,
+        simulation_request_id: str,
+        expected_current_version: int,
+        change_summary: str | None = None,
+    ) -> dict[str, Any]:
+        return self._object(
+            "POST",
+            f"/api/v1/projects/{quote(project_id, safe='')}/versions",
+            json={
+                "simulation_request_id": simulation_request_id,
+                "expected_current_version": expected_current_version,
+                "change_summary": change_summary,
+            },
+        )
+
+    def restore_project_version(
+        self,
+        project_id: str,
+        version_number: int,
+        expected_current_version: int,
+        change_summary: str | None = None,
+    ) -> dict[str, Any]:
+        if version_number < 1:
+            raise ValueError("version_number must be positive.")
+        return self._object(
+            "POST",
+            f"/api/v1/projects/{quote(project_id, safe='')}/versions/{version_number}/restore",
+            json={
+                "expected_current_version": expected_current_version,
+                "change_summary": change_summary,
+            },
+        )
 
     def update_project(self, project_id: str, changes: dict[str, Any]) -> dict[str, Any]:
         return self._object(
@@ -156,6 +246,29 @@ class BESSAPIClient:
             f"/api/v1/projects/{quote(project_id, safe='')}/members",
             json={"user_id": user_id, "role": role},
         )
+
+    def update_project_member_role(
+        self, project_id: str, user_id: str, role: str
+    ) -> dict[str, Any]:
+        return self._object(
+            "PATCH",
+            (
+                f"/api/v1/projects/{quote(project_id, safe='')}/members/"
+                f"{quote(user_id, safe='')}/role"
+            ),
+            json={"role": role},
+        )
+
+    def remove_project_member(self, project_id: str, user_id: str) -> None:
+        result = self._request(
+            "DELETE",
+            (
+                f"/api/v1/projects/{quote(project_id, safe='')}/members/"
+                f"{quote(user_id, safe='')}"
+            ),
+        )
+        if result is not None:
+            raise BESSAPIError("Backend returned an unexpected response for member removal.")
 
     def submit_sizing(
         self,
@@ -216,6 +329,20 @@ class BESSAPIClient:
             f"/api/v1/sizing/{quote(request_id, safe='')}",
         )
 
+    def list_recent_sizing_runs(self, limit: int = 10) -> list[dict[str, Any]]:
+        if not 1 <= limit <= 50:
+            raise ValueError("limit must be between 1 and 50.")
+        result = self._request("GET", f"/api/v1/sizing/recent?limit={limit}")
+        if not isinstance(result, list) or any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("request_id"), str)
+            or not isinstance(item.get("created_at"), str)
+            or not isinstance(item.get("status"), str)
+            for item in result
+        ):
+            raise BESSAPIError("Backend returned an invalid recent sizing activity list.")
+        return result
+
     def _object(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         result = self._request(method, path, **kwargs)
         if not isinstance(result, dict):
@@ -223,8 +350,10 @@ class BESSAPIClient:
         return result
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+        headers = dict(kwargs.pop("headers", {}) or {})
+        headers.setdefault("X-Correlation-ID", str(uuid4()))
         try:
-            response = self._client.request(method, path, **kwargs)
+            response = self._client.request(method, path, headers=headers, **kwargs)
         except httpx.TimeoutException as exc:
             raise BESSAPIError("Backend request timed out.") from exc
         except httpx.RequestError as exc:
@@ -235,21 +364,33 @@ class BESSAPIClient:
                 error_detail = response.json().get("detail")
                 if isinstance(error_detail, dict):
                     candidate = error_detail.get("code")
-                    if candidate == "catalog_mismatch":
+                    if isinstance(candidate, str):
                         error_code = candidate
             except (AttributeError, ValueError):
                 pass
-            message = (
-                "Catalog changed or no longer matches the verified manifest; "
-                "retrieve the manifest and retry."
-                if error_code == "catalog_mismatch"
-                else f"Backend request failed with HTTP {response.status_code}."
-            )
+            status_messages = {
+                401: "Your sign-in has expired. Sign in again to continue.",
+                403: "You do not have permission to perform this action.",
+                404: "The requested project or record is unavailable.",
+                409: "The project changed or conflicts with this request. Refresh and retry.",
+            }
+            if error_code == "catalog_mismatch":
+                message = (
+                    "The server catalog changed; refresh the catalog and retry the sizing run."
+                )
+            elif response.status_code in status_messages:
+                message = status_messages[response.status_code]
+            elif response.status_code >= 500:
+                message = "The backend is temporarily unavailable. Try again later."
+            else:
+                message = f"Backend request could not be completed (HTTP {response.status_code})."
             raise BESSAPIError(
                 message,
                 status_code=response.status_code,
                 error_code=error_code,
             )
+        if response.status_code == 204:
+            return None
         try:
             return response.json()
         except ValueError as exc:

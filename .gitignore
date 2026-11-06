@@ -27,3 +27,4 @@ __pycache__/
 # Internal BESS database — never upload to GitHub
 data/BESS_DATABASE.xlsx
 data/*.xlsx
+.codegraphy/*

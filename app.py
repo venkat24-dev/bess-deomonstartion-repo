@@ -5,16 +5,25 @@ Deploy:        push the repository to GitHub and point Streamlit Community Cloud
 """
 from __future__ import annotations
 
-import io
 import os
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from streamlit.errors import StreamlitAuthError, StreamlitSecretNotFoundError
 
 from bess import analyser
+from bess.catalog_import import (
+    MAX_CATALOG_UPLOAD_SIZE_MB,
+    CatalogUploadError,
+    CatalogValidationError,
+    parse_catalog_upload,
+)
+from bess.calculation_trace import build_trace_map, render_calculation_info
 from bess.database import AC_KEYS, AC_LABELS, load_database, select_by_c_rate
+from bess.dashboard import render_engineering_dashboard
 from bess.engine import (
     AugEvent,
     Inputs,
@@ -27,6 +36,15 @@ from bess.engine import (
     status_labels,
 )
 from bess.report import BAD, GOOD, build_excel, verification_frame
+from bess.api_client import BESSAPIClient, BESSAPIError
+from bess.project_workspace import render_profile, render_project_workspace
+from bess.streamlit_auth import (
+    APIAccessTokenUnavailable,
+    api_access_token,
+    bind_authenticated_user,
+    clear_authenticated_session,
+    is_logged_in,
+)
 
 st.set_page_config(page_title="BESS Sizing", page_icon="🔋", layout="wide")
 
@@ -43,8 +61,8 @@ def _default_db():
 
 
 @st.cache_data(show_spinner=False)
-def _uploaded_db(data: bytes):
-    return load_database(io.BytesIO(data))
+def _uploaded_db(data: bytes, filename: str):
+    return parse_catalog_upload(data, filename)
 
 
 def _status_style(v):
@@ -76,35 +94,217 @@ def yesno(label, key, default=False, help=None):
     return st.radio(label, ["No", "Yes"], index=1 if default else 0, horizontal=True, key=key, help=help) == "Yes"
 
 
+def _company_auth_sidebar():
+    st.sidebar.divider()
+    st.sidebar.header("Company account")
+    try:
+        auth_settings = st.secrets.get("auth")
+    except StreamlitSecretNotFoundError:
+        auth_settings = None
+    provider = os.environ.get("BESS_OIDC_PROVIDER", "microsoft").strip()
+    provider_settings = auth_settings.get(provider) if isinstance(auth_settings, Mapping) else None
+    exposed_tokens = auth_settings.get("expose_tokens", []) if isinstance(auth_settings, Mapping) else []
+    if isinstance(exposed_tokens, str):
+        exposed_tokens = [exposed_tokens]
+    api_base_url = os.environ.get("BESS_API_BASE_URL", "").strip()
+    missing = []
+    if not isinstance(auth_settings, Mapping):
+        missing.extend(
+            ["auth.redirect_uri", "auth.cookie_secret", f"auth.{provider}"]
+        )
+    else:
+        for setting in ("redirect_uri", "cookie_secret"):
+            if not auth_settings.get(setting):
+                missing.append(f"auth.{setting}")
+        if not isinstance(provider_settings, Mapping):
+            missing.append(f"auth.{provider}")
+        else:
+            for setting in ("client_id", "client_secret", "server_metadata_url"):
+                if not provider_settings.get(setting):
+                    missing.append(f"auth.{provider}.{setting}")
+            client_kwargs = provider_settings.get("client_kwargs", {})
+            scopes = (
+                client_kwargs.get("scope", "").split()
+                if isinstance(client_kwargs, Mapping)
+                else []
+            )
+            if not any(
+                scope not in {"openid", "profile", "email", "offline_access"}
+                for scope in scopes
+            ):
+                missing.append(f"auth.{provider}.client_kwargs.scope (API delegated scope)")
+    if "access" not in exposed_tokens:
+        missing.append("auth.expose_tokens = [\"access\"]")
+    if not api_base_url:
+        missing.append("BESS_API_BASE_URL")
+    if missing:
+        st.sidebar.caption("○ Backend sign-in is not configured")
+        st.sidebar.caption("Local calculator available; project storage is offline.")
+        with st.sidebar.expander("Required sign-in configuration"):
+            st.write("Provide these server-side settings:")
+            st.code("\n".join(missing))
+        if is_logged_in(st.user) and st.sidebar.button(
+            "Sign out", key="bess_logout_unconfigured"
+        ):
+            clear_authenticated_session(st.session_state)
+            st.logout()
+            st.stop()
+        return None, None
+
+    if not is_logged_in(st.user):
+        st.sidebar.caption("○ Not signed in")
+        if st.sidebar.button("Sign in with company SSO", key="bess_login"):
+            try:
+                st.login(provider)
+            except StreamlitAuthError:
+                st.sidebar.warning("Company sign-in is unavailable; check OIDC setup.")
+                with st.sidebar.expander("Sign-in troubleshooting"):
+                    st.write(
+                        "Verify server-side OIDC settings, provider registration, "
+                        "callback URL, and the Authlib dependency."
+                    )
+        return api_base_url, None
+    st.sidebar.caption("● Signed in")
+    try:
+        token = api_access_token(st.user)
+    except APIAccessTokenUnavailable as exc:
+        st.sidebar.warning("Company account is signed in, but no API access token is available.")
+        with st.sidebar.expander("Token configuration"):
+            st.write(str(exc))
+        token = None
+    if token:
+        st.sidebar.caption("● Company API connected")
+    if st.sidebar.button("Sign out", key="bess_logout"):
+        clear_authenticated_session(st.session_state)
+        st.logout()
+        st.stop()
+    return api_base_url, token
+
+
+def _render_workspace_page(page, client, profile, projects, recent_runs=None):
+    if page == "Home / Projects":
+        render_project_workspace(st, client, profile, projects, recent_runs)
+    elif page == "Profile":
+        render_profile(st, profile, projects, recent_runs)
+    else:
+        raise ValueError(f"Unknown workspace page: {page}")
+
+
 # ---------------------------------------------------------------------------
 # sidebar
 # ---------------------------------------------------------------------------
 with st.sidebar:
+    st.header("Workspace")
+    workspace_page = st.radio(
+        "Page",
+        ["Home / Projects", "Calculator", "Profile"],
+        key="bess_workspace_navigation",
+        label_visibility="collapsed",
+    )
+    st.divider()
     st.header("Settings")
-    up = st.file_uploader("Product database (.xlsx)", type=["xlsx"], help="Leave empty to use the bundled BESS_DATABASE.xlsx")
-    try:
-        db = _uploaded_db(up.getvalue()) if up is not None else _default_db()
-        st.caption(f"{'Uploaded' if up is not None else 'Bundled'} database: {len(db)} container options")
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"Could not read the database: {exc}")
-        st.stop()
-    status_style = st.radio("Match result labels", ["MATCHED / NOT MATCHED", "TRUE / FALSE"]).split(" / ")[0]
+    st.subheader("Product Database")
+    up = st.file_uploader(
+        "Product database (.xlsx)",
+        help="Leave empty to use the bundled BESS_DATABASE.xlsx. CSV files are not supported.",
+        max_upload_size=MAX_CATALOG_UPLOAD_SIZE_MB,
+    )
+    st.caption(
+        f"Excel workbook only · Maximum file size {MAX_CATALOG_UPLOAD_SIZE_MB} MB"
+    )
+    catalog_state_key = "last_valid_product_catalog"
+    if catalog_state_key not in st.session_state:
+        st.session_state[catalog_state_key] = _default_db()
+    if up is None:
+        db = _default_db()
+        st.session_state[catalog_state_key] = db
+        db_source = "Bundled"
+    else:
+        try:
+            db = _uploaded_db(up.getvalue(), up.name)
+            st.session_state[catalog_state_key] = db
+            db_source = "Uploaded"
+        except CatalogValidationError as exc:
+            st.error("Could not use the uploaded product database: " + "; ".join(exc.report.errors))
+            db = st.session_state[catalog_state_key]
+            db_source = "Last valid"
+            st.warning("The existing product catalog is unchanged and remains active.")
+        except CatalogUploadError as exc:
+            st.error(str(exc))
+            db = st.session_state[catalog_state_key]
+            db_source = "Last valid"
+            st.warning("The existing product catalog is unchanged and remains active.")
+    st.caption("Active catalog")
+    st.caption(f"● {db_source} database: {len(db)} container options")
+    st.divider()
+    st.subheader("Calculation Preferences")
+    status_style = st.radio(
+        "Match result labels",
+        ["MATCHED / NOT MATCHED", "TRUE / FALSE"],
+        help="Changes the displayed labels only; calculation results are unchanged.",
+    ).split(" / ")[0]
     status_style = "TRUE/FALSE" if status_style == "TRUE" else "MATCHED"
     aux_kw_fix = False
     if any(c.aux_suspect for c in db):
         aux_kw_fix = st.checkbox(
             "Read flagged aux loads as kW",
             value=False,
-            help="Some database aux values (e.g. 4.06 'MW' per 6.626 MWh container) look like kW. "
-            "Tick to divide those values by 1000. See the Database tab.",
+            help="For flagged catalog values only, divide suspected kW values by 1000. "
+            "Unflagged container values are not changed.",
         )
+    else:
+        st.caption("No flagged auxiliary-load values in the active catalog.")
     st.divider()
-    st.caption("BESS Sizing Software - spec BESS_SIZING_2_0")
+    api_base_url, access_token = _company_auth_sidebar()
+    st.divider()
+    st.caption("BESS Sizing Software")
+    st.caption("Specification: BESS_SIZING_2_0")
+
+workspace_profile, workspace_projects, workspace_recent_runs = None, None, None
+if workspace_page != "Calculator" and api_base_url and access_token:
+    try:
+        with BESSAPIClient(api_base_url, access_token) as api_client:
+            with st.spinner("Loading your authorized workspace..."):
+                workspace_profile = api_client.get_profile()
+            authenticated_user_id = workspace_profile["user"]["id"]
+            if not bind_authenticated_user(st.session_state, authenticated_user_id):
+                st.logout()
+                st.stop()
+            with st.spinner("Loading projects and recent sizing activity..."):
+                workspace_projects = api_client.list_projects()
+                workspace_recent_runs = api_client.list_recent_sizing_runs()
+            _render_workspace_page(workspace_page, api_client, workspace_profile, workspace_projects, workspace_recent_runs)
+    except (BESSAPIError, ValueError) as exc:
+        if isinstance(exc, BESSAPIError) and exc.status_code == 401:
+            clear_authenticated_session(st.session_state)
+            st.logout()
+            st.stop()
+        safe_message = (
+            str(exc)
+            if isinstance(exc, BESSAPIError)
+            else "BESS_API_BASE_URL is not a valid secure API URL."
+        )
+        st.error(safe_message)
+elif workspace_page != "Calculator":
+    _render_workspace_page(workspace_page, None, None, None)
+
+if workspace_page != "Calculator":
+    st.stop()
 
 st.title("🔋 BESS Sizing Software")
 st.caption("Container selection, year-wise discharge / charge performance, BOL-EOL verification, augmentation and what-if analysis.")
 
-tab_in, tab_res, tab_an, tab_db = st.tabs(["Inputs", "Results", "Analyser", "Database"])
+tab_dashboard, tab_in, tab_res, tab_an, tab_db = st.tabs(
+    [
+        "Engineering Dashboard",
+        "Calculator - Inputs",
+        "Calculator - Results",
+        "Calculator - Analyser",
+        "Calculator - Database",
+    ],
+    key="bess_calculator_tabs",
+    on_change="rerun",
+)
 
 # ---------------------------------------------------------------------------
 # INPUTS
@@ -112,9 +312,30 @@ tab_in, tab_res, tab_an, tab_db = st.tabs(["Inputs", "Results", "Analyser", "Dat
 with tab_in:
     st.subheader("1. Project inputs")
     c1, c2, c3 = st.columns(3)
-    req_e = c1.number_input("Required energy as per project (MWh)", 1.0, 1e6, 100.0, 1.0)
-    req_p = c2.number_input("Required power as per project (MW)", 0.1, 1e5, 25.0, 0.5)
-    crate = c3.number_input("C-rate", 0.05, 2.0, 0.25, 0.01, help="Used to pick the container from the database")
+    with c1:
+        req_e = st.number_input("Required energy as per project (MWh)", 1.0, 1e6, 100.0, 1.0)
+        render_calculation_info(
+            st,
+            "required_energy",
+            trace=build_trace_map({"required_energy_mwh": req_e}).get("required_energy"),
+            title="Energy",
+        )
+    with c2:
+        req_p = st.number_input("Required power as per project (MW)", 0.1, 1e5, 25.0, 0.5)
+        render_calculation_info(
+            st,
+            "required_power",
+            trace=build_trace_map({"required_power_mw": req_p}).get("required_power"),
+            title="Power",
+        )
+    with c3:
+        crate = st.number_input("C-rate", 0.05, 2.0, 0.25, 0.01, help="Used to pick the container from the database")
+        render_calculation_info(
+            st,
+            "c_rate",
+            trace=build_trace_map({"c_rate": crate, "discharge_time_h": 1 / crate, "charge_time_h": 1 / crate}).get("c_rate"),
+            title="C-rate",
+        )
 
     tmode = st.radio(
         "Charge / discharge duration",
@@ -131,16 +352,36 @@ with tab_in:
         st.caption(f"Duration = 1 / {crate:g} = {1 / crate:.2f} h for both charge and discharge")
 
     c1, c2, c3, c4 = st.columns(4)
-    years = int(c1.number_input("Total project duration (years)", 1, MAX_YEARS, 10, 1))
-    temp = c2.number_input("Operating temperature (°C)", -20.0, 60.0, 25.0, 1.0)
-    avail = c3.number_input("BESS availability (%)", 50.0, 100.0, 99.0, 0.1)
-    dod = c4.number_input("DOD (%)", 10.0, 100.0, 100.0, 1.0)
+    with c1:
+        years = int(st.number_input("Total project duration (years)", 1, MAX_YEARS, 10, 1))
+        render_calculation_info(
+            st,
+            "verification",
+            trace=build_trace_map({"project_years": years}).get("verification"),
+            title="Duration",
+        )
+    with c2:
+        temp = st.number_input("Operating temperature (°C)", -20.0, 60.0, 25.0, 1.0)
+    with c3:
+        avail = st.number_input("BESS availability (%)", 50.0, 100.0, 99.0, 0.1)
+        render_calculation_info(
+            st,
+            "availability",
+            trace=build_trace_map({"availability_pct": avail}).get("availability"),
+            title="Availability",
+        )
+    with c4:
+        dod = st.number_input("DOD (%)", 10.0, 100.0, 100.0, 1.0)
 
     c1, c2, c3, c4 = st.columns(4)
-    bol_e = c1.number_input("BOL energy (MWh)", 1.0, 1e6, float(req_e), 1.0, key=f"bol_{req_e}")
-    eol_e = c2.number_input("EOL energy (MWh)", 1.0, 1e6, float(req_e), 1.0, key=f"eol_{req_e}")
-    min_rte = c3.number_input("Minimum RTE at EOL (%)", 10.0, 100.0, 80.0, 0.5)
-    cycles_req = int(c4.number_input("Number of cycles (project)", 1, 100000, 365 * years, 1, key=f"cyc_{years}"))
+    with c1:
+        bol_e = st.number_input("BOL energy (MWh)", 1.0, 1e6, float(req_e), 1.0, key=f"bol_{req_e}")
+    with c2:
+        eol_e = st.number_input("EOL energy (MWh)", 1.0, 1e6, float(req_e), 1.0, key=f"eol_{req_e}")
+    with c3:
+        min_rte = st.number_input("Minimum RTE at EOL (%)", 10.0, 100.0, 80.0, 0.5)
+    with c4:
+        cycles_req = int(st.number_input("Number of cycles (project)", 1, 100000, 365 * years, 1, key=f"cyc_{years}"))
 
     c1, c2 = st.columns(2)
     with c1:
@@ -368,12 +609,33 @@ def show_option(o, key):
         st.error("NOT ACCEPTED - at least one requirement is not met (see the checks below).")
     st.caption(o.note)
     m = st.columns(6)
-    m[0].metric("Initial containers", s["n_init"])
-    m[1].metric("Installed DC (MWh)", f"{s['installed_mwh']:.1f}")
-    m[2].metric("Margin applied", f"{o.margin_applied_pct:.1f} %", f"effective {s['effective_margin_pct']:.1f} %", delta_color="off")
-    m[3].metric("BOL energy at POI (MWh)", f"{s['bol_energy']:.1f}")
-    m[4].metric("EOL energy at POI (MWh)", f"{s['eol_energy']:.1f}")
-    m[5].metric("EOL RTE incl. aux", f"{s['rte_eol_incl']:.2f} %")
+    with m[0]:
+        st.metric("Initial containers", s["n_init"])
+        render_calculation_info(
+            st,
+            "container_selection",
+            trace=build_trace_map({"required_energy_mwh": inp.required_energy_mwh, "margin_min_pct": inp.margin_min_pct, "margin_max_pct": inp.margin_max_pct, "container_energy_mwh": r.container.energy_mwh}, result=r).get("container_selection"),
+            title="Container count",
+        )
+    with m[1]:
+        st.metric("Installed DC (MWh)", f"{s['installed_mwh']:.1f}")
+        render_calculation_info(
+            st,
+            "guaranteed_energy",
+            trace=build_trace_map(result=r).get("guaranteed_energy"),
+            title="Installed DC",
+        )
+    with m[2]:
+        st.metric("Margin applied", f"{o.margin_applied_pct:.1f} %", f"effective {s['effective_margin_pct']:.1f} %", delta_color="off")
+    with m[3]:
+        st.metric("BOL energy at POI (MWh)", f"{s['bol_energy']:.1f}")
+        render_calculation_info(st, "guaranteed_energy", trace=build_trace_map(result=r).get("guaranteed_energy"), title="BOL energy")
+    with m[4]:
+        st.metric("EOL energy at POI (MWh)", f"{s['eol_energy']:.1f}")
+        render_calculation_info(st, "guaranteed_energy", trace=build_trace_map(result=r).get("guaranteed_energy"), title="EOL energy")
+    with m[5]:
+        st.metric("EOL RTE incl. aux", f"{s['rte_eol_incl']:.2f} %")
+        render_calculation_info(st, "rte", trace=build_trace_map(result=r).get("rte"), title="RTE")
     for w in r.warnings:
         st.warning(w)
 
@@ -428,6 +690,28 @@ def show_option(o, key):
         st.line_chart(pd.DataFrame({"Required": v["Required energy (MWh)"], "Calculated": v["Calculated energy (MWh)"]}))
         st.markdown("**AC RTE (%)**")
         st.line_chart(pd.DataFrame({"Excl. aux": r.perf["AC RTE excl. aux (%)"], "Incl. aux": r.perf["AC RTE incl. aux (%)"], "Required": v["Required RTE (%)"]}))
+
+
+if tab_dashboard.open:
+    if outcomes:
+        dashboard_options = [
+            item.result.summary.get("container", item.result.container.label)
+            for item in outcomes
+        ]
+        dashboard_selection = st.selectbox(
+            "Dashboard container option",
+            range(len(outcomes)),
+            format_func=lambda index: dashboard_options[index],
+            key="bess_dashboard_container_option",
+        )
+        render_engineering_dashboard(
+            st,
+            outcomes[dashboard_selection].result,
+            comparison_cases=[item.result for item in outcomes],
+        )
+    else:
+        dashboard_error = "; ".join(errors) if errors else None
+        render_engineering_dashboard(st, None, error=dashboard_error)
 
 
 with tab_res:

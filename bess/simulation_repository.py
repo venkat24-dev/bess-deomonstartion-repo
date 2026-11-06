@@ -8,13 +8,26 @@ from math import isfinite
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select, text
+from sqlalchemy import and_, exists, or_, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 
+from bess.authorization import Operation
 from bess.db_connection import DatabaseConfigurationError, get_engine, get_session_factory
-from bess.models import SimulationRun, SizingRequest as SizingRequestRecord
-from bess.project_repository import ProjectAccessError, _project_role, _require_project_role
+from bess.models import (
+    OrganizationMember,
+    Project,
+    ProjectAccessGrant,
+    ProjectMember,
+    SimulationRun,
+    SizingRequest as SizingRequestRecord,
+    User,
+)
+from bess.project_repository import (
+    ProjectAccessError,
+    _require_project_permission,
+    _require_project_role,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -173,7 +186,10 @@ class SimulationRepository:
                 if idempotency_key:
                     existing = session.scalar(
                         select(SizingRequestRecord)
-                        .where(SizingRequestRecord.idempotency_key == idempotency_key)
+                        .where(
+                            SizingRequestRecord.idempotency_key == idempotency_key,
+                            SizingRequestRecord.created_by_user_id == user_id,
+                        )
                         .options(selectinload(SizingRequestRecord.simulation_runs))
                         .with_for_update()
                     )
@@ -210,8 +226,8 @@ class SimulationRepository:
             raise
         except IntegrityError as exc:
             if idempotency_key:
-                duplicate = self._find_duplicate(idempotency_key, input_snapshot)
-                if duplicate is not None or self._duplicate_exists(idempotency_key):
+                duplicate = self._find_duplicate(idempotency_key, user_id, input_snapshot)
+                if duplicate is not None or self._duplicate_exists(idempotency_key, user_id):
                     return duplicate
             logger.error("Could not start sizing simulation (%s)", type(exc).__name__)
             raise SimulationPersistenceError("Could not create the sizing request.") from exc
@@ -244,13 +260,17 @@ class SimulationRepository:
     def _find_duplicate(
         self,
         idempotency_key: str,
+        user_id: UUID,
         requested_snapshot: dict[str, Any],
     ) -> dict[str, Any] | None:
         try:
             with get_session_factory()() as session:
                 existing = session.scalar(
                     select(SizingRequestRecord)
-                    .where(SizingRequestRecord.idempotency_key == idempotency_key)
+                    .where(
+                        SizingRequestRecord.idempotency_key == idempotency_key,
+                        SizingRequestRecord.created_by_user_id == user_id,
+                    )
                     .options(selectinload(SizingRequestRecord.simulation_runs))
                 )
                 if existing is None:
@@ -262,13 +282,14 @@ class SimulationRepository:
             logger.error("Could not resolve sizing idempotency key (%s)", type(exc).__name__)
             raise SimulationPersistenceError("Could not resolve the sizing request.") from exc
 
-    def _duplicate_exists(self, idempotency_key: str) -> bool:
+    def _duplicate_exists(self, idempotency_key: str, user_id: UUID) -> bool:
         try:
             with get_session_factory()() as session:
                 return (
                     session.scalar(
                         select(SizingRequestRecord.id).where(
-                            SizingRequestRecord.idempotency_key == idempotency_key
+                            SizingRequestRecord.idempotency_key == idempotency_key,
+                            SizingRequestRecord.created_by_user_id == user_id,
                         )
                     )
                     is not None
@@ -358,12 +379,16 @@ class SimulationRepository:
                 if request.project_id is None:
                     if request.created_by_user_id != user_id:
                         return None
-                elif _project_role(session, request.project_id, user_id) not in {
-                    "owner",
-                    "editor",
-                    "viewer",
-                }:
-                    return None
+                else:
+                    try:
+                        _require_project_permission(
+                            session,
+                            request.project_id,
+                            user_id,
+                            Operation.READ_PROJECT_CONTENT,
+                        )
+                    except ProjectAccessError:
+                        return None
                 run = request.simulation_runs[0] if request.simulation_runs else None
                 if run is None and request.status == "COMPLETED":
                     raise SimulationPersistenceError("The completed sizing result is missing.")
@@ -392,3 +417,94 @@ class SimulationRepository:
         except (DatabaseConfigurationError, SQLAlchemyError) as exc:
             logger.error("Could not retrieve sizing simulation (%s)", type(exc).__name__)
             raise SimulationPersistenceError("Could not retrieve the sizing simulation.") from exc
+
+    def list_recent_runs(self, user_id: UUID, limit: int = 10) -> list[dict[str, Any]]:
+        if not 1 <= limit <= 50:
+            raise ValueError("limit must be between 1 and 50.")
+        now = _now()
+        member_access = exists(
+            select(ProjectMember.project_id)
+            .join(Project, Project.id == ProjectMember.project_id)
+            .join(
+                OrganizationMember,
+                OrganizationMember.organization_id == Project.organization_id,
+            )
+            .join(User, User.id == ProjectMember.user_id)
+            .where(
+                ProjectMember.project_id == SizingRequestRecord.project_id,
+                ProjectMember.user_id == user_id,
+                Project.access_state == "active",
+                OrganizationMember.user_id == user_id,
+                User.is_active.is_(True),
+            )
+        )
+        grant_access = exists(
+            select(ProjectAccessGrant.id)
+            .join(Project, Project.id == ProjectAccessGrant.project_id)
+            .join(
+                OrganizationMember,
+                OrganizationMember.organization_id == Project.organization_id,
+            )
+            .join(User, User.id == ProjectAccessGrant.user_id)
+            .where(
+                ProjectAccessGrant.project_id == SizingRequestRecord.project_id,
+                ProjectAccessGrant.user_id == user_id,
+                ProjectAccessGrant.access_scope == "content_read",
+                ProjectAccessGrant.revoked_at.is_(None),
+                or_(
+                    ProjectAccessGrant.expires_at.is_(None),
+                    ProjectAccessGrant.expires_at > now,
+                ),
+                Project.access_state == "active",
+                OrganizationMember.user_id == user_id,
+                OrganizationMember.role == "manager",
+                User.is_active.is_(True),
+            )
+        )
+        visible_project_request = and_(
+            SizingRequestRecord.project_id.is_not(None),
+            or_(member_access, grant_access),
+        )
+        try:
+            with get_session_factory()() as session:
+                requests = session.scalars(
+                    select(SizingRequestRecord)
+                    .where(
+                        or_(
+                            and_(
+                                SizingRequestRecord.project_id.is_(None),
+                                SizingRequestRecord.created_by_user_id == user_id,
+                            ),
+                            visible_project_request,
+                        )
+                    )
+                    .options(selectinload(SizingRequestRecord.simulation_runs))
+                    .order_by(SizingRequestRecord.created_at.desc())
+                    .limit(limit)
+                ).all()
+                recent = []
+                for request in requests:
+                    run = request.simulation_runs[0] if request.simulation_runs else None
+                    result = _completed_response(request, run) if run is not None else None
+                    if run is None and request.status == "COMPLETED":
+                        raise SimulationPersistenceError(
+                            "The completed sizing result is missing."
+                        )
+                    recent.append(
+                        {
+                            "request_id": str(request.id),
+                            "project_id": (
+                                str(request.project_id) if request.project_id else None
+                            ),
+                            "created_at": request.created_at.isoformat(),
+                            "status": run.status if run is not None else request.status,
+                            "container_id": run.source_container_key if run else None,
+                            "summary": result.get("summary") if result else None,
+                        }
+                    )
+                return recent
+        except SimulationPersistenceError:
+            raise
+        except (DatabaseConfigurationError, SQLAlchemyError) as exc:
+            logger.error("Could not list recent sizing runs (%s)", type(exc).__name__)
+            raise SimulationPersistenceError("Could not list recent sizing runs.") from exc
